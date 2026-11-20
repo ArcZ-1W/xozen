@@ -7,7 +7,11 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import pino from "pino";
 import QRCode from "qrcode";
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } from "@whiskeysockets/baileys";
+import * as B from "baileys"; // alias di package.json -> paket Baileys yang dipakai
+const M = B.useMultiFileAuthState ? B : B.default;
+const makeWASocket = [B.default, B.default?.default, M.makeWASocket].find(f => typeof f === "function");
+const { useMultiFileAuthState, DisconnectReason, Browsers } = M;
+const getVersion = M.fetchLatestBaileysVersion || M.fetchLatestWAWebVersion;
 
 const E = process.env, PORT = +E.PORT || 3000;
 const DATA = path.resolve(E.DATA_DIR || "./data"), AUTH_DIR = path.join(DATA, "wa-auth");
@@ -47,8 +51,11 @@ const useCode = (u, pur, c) => { const k = pur + ":" + u.username, r = codes.get
 const sendCode = (u, pur) => { const c = String(crypto.randomInt(100000, 1000000)); codes.set(pur + ":" + u.username, { c, exp: Date.now() + 6e5, n: 0 }); return sendWA(u.wa, `Kode verifikasi Xozen: *${c}*\nBerlaku 10 menit. Jangan bagikan kode ini ke siapa pun.`); };
 
 /* ---------- bot WhatsApp ---------- */
-const WA = { state: "stopped", me: "", qr: "", code: "", log: [], sock: null, want: false, busy: false, phone: "" };
-const log = t => { WA.log.push(new Date().toLocaleTimeString("id-ID") + " " + t); if (WA.log.length > 100) WA.log.shift(); };
+const LF = path.join(DATA, "server.log");
+try { if (fs.statSync(LF).size > 2e6) fs.renameSync(LF, LF + ".1"); } catch {}
+const WA = { state: "stopped", me: "", qr: "", code: "", log: [], sock: null, want: false, busy: false, phone: "", retry: 0 };
+try { WA.log = fs.readFileSync(LF, "utf8").split("\n").filter(Boolean).slice(-100); } catch {}
+const log = t => { const l = new Date().toLocaleString("id-ID", { hour12: false }) + " " + t; WA.log.push(l); if (WA.log.length > 100) WA.log.shift(); console.log(l); fs.appendFile(LF, l + "\n", () => {}); };
 const view = () => ({ state: WA.state, me: WA.me, qr: WA.qr, code: WA.code, log: WA.log });
 async function sendWA(num, text) {
   num = nw(num); if (!num || WA.state !== "ready" || !WA.sock) return false;
@@ -66,40 +73,49 @@ async function runCmd(c, a) {
     const j = await r.json(); return (j.choices?.[0]?.message?.content || "").trim() || "(tidak ada jawaban)";
   }
 }
-async function onMsg({ messages, type }) {
+const textOf = m => { let x = m.message; for (let i = 0; i < 3 && x; i++) x = x.ephemeralMessage?.message || x.viewOnceMessage?.message || x.documentWithCaptionMessage?.message || x; return x ? String(x.conversation || x.extendedTextMessage?.text || x.imageMessage?.caption || x.videoMessage?.caption || "").trim() : ""; };
+const onMsg = sock => async ({ messages, type }) => {
   if (type !== "notify") return;
   for (const m of messages) {
     const jid = m.key.remoteJid;
     if (!m.message || m.key.fromMe || !jid || jid === "status@broadcast" || jid.endsWith("@newsletter")) continue;
-    const t = (m.message.conversation || m.message.extendedTextMessage?.text || "").trim();
+    const t = textOf(m);
     if (!t.startsWith(PREFIX)) continue;
     const [c, ...a] = t.slice(PREFIX.length).split(/\s+/);
-    try { const r = await runCmd(c.toLowerCase(), a.join(" ")); if (r) await WA.sock.sendMessage(jid, { text: r }, { quoted: m }); } catch (e) { log("Error perintah: " + e.message); }
+    try { const r = await runCmd(c.toLowerCase(), a.join(" ")); if (r) await sock.sendMessage(jid, { text: r }, { quoted: m }); }
+    catch (e) { log("Error perintah " + PREFIX + c + ": " + e.message); }
   }
-}
+};
 async function waStart(phone) {
   if (WA.sock || WA.busy) return;
   WA.busy = true; WA.want = true; WA.phone = nw(phone); WA.qr = WA.code = ""; WA.state = "starting";
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({}));
-    const sock = makeWASocket({ version, auth: state, logger: pino({ level: "silent" }), printQRInTerminal: false, browser: Browsers.ubuntu("Xozen"), markOnlineOnConnect: false });
-    WA.sock = sock;
+    const v = getVersion ? await Promise.race([getVersion().catch(() => null), new Promise(r => setTimeout(() => r(null), 8e3))]) : null;
+    // Kode pairing hanya diterima WhatsApp bila nama browser standar (Chrome), jadi jangan diganti.
+    const sock = makeWASocket({ ...(v && v.version ? { version: v.version } : {}), auth: state, logger: pino({ level: "silent" }), printQRInTerminal: false, browser: Browsers.ubuntu("Chrome"), markOnlineOnConnect: false, syncFullHistory: false, generateHighQualityLinkPreview: false, connectTimeoutMs: 6e4, keepAliveIntervalMs: 25e3, getMessage: async () => undefined });
+    WA.sock = sock; let asked = false;
+    const askPair = async () => {
+      if (asked || !WA.phone || state.creds.registered || WA.sock !== sock) return; asked = true;
+      try { const c = await sock.requestPairingCode(WA.phone); WA.code = c.match(/.{1,4}/g).join("-"); WA.state = "pair"; log("Kode pairing dibuat. Masukkan di WhatsApp > Perangkat tertaut > Tautkan dengan nomor telepon."); }
+      catch (e) { asked = false; log("Gagal membuat kode pairing: " + e.message); }
+    };
     sock.ev.on("creds.update", saveCreds);
-    sock.ev.on("messages.upsert", onMsg);
+    sock.ev.on("messages.upsert", onMsg(sock));
     sock.ev.on("connection.update", async u => {
       if (WA.sock !== sock) return;
       const { connection, lastDisconnect, qr } = u;
+      if (connection === "connecting") setTimeout(askPair, 3000);
       if (qr && !state.creds.registered) {
-        if (WA.phone) {
-          if (!WA.code) try { const c = await sock.requestPairingCode(WA.phone); WA.code = c.slice(0, 4) + "-" + c.slice(4); WA.state = "pair"; log("Kode pairing dibuat. Masukkan di WhatsApp > Perangkat tertaut > Tautkan dengan nomor telepon."); } catch (e) { log("Gagal membuat kode pairing: " + e.message); }
-        } else { WA.qr = await QRCode.toDataURL(qr, { margin: 1, width: 260 }); WA.state = "qr"; log("QR siap, silakan scan."); }
+        if (WA.phone) await askPair();
+        else { WA.qr = await QRCode.toDataURL(qr, { margin: 1, width: 260 }); WA.state = "qr"; log("QR siap, silakan scan."); }
       }
-      if (connection === "open") { WA.qr = WA.code = ""; WA.me = String(sock.user?.id || "").split(":")[0].split("@")[0]; WA.state = "ready"; log("Terhubung sebagai " + WA.me); }
+      if (connection === "open") { WA.qr = WA.code = ""; WA.retry = 0; WA.me = String(sock.user?.id || "").split(":")[0].split("@")[0]; WA.state = "ready"; log("Terhubung sebagai " + WA.me); }
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode; WA.sock = null; WA.qr = WA.code = "";
         if (code === DisconnectReason.loggedOut) { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); WA.me = ""; WA.want = false; WA.state = "stopped"; log("Sesi keluar dari HP. Login ulang diperlukan."); }
-        else if (WA.want) { WA.state = "starting"; log("Koneksi terputus (kode " + code + "), menyambung ulang..."); setTimeout(() => WA.want && waStart(WA.phone), code === DisconnectReason.restartRequired ? 500 : 3000); }
+        else if (code === DisconnectReason.connectionReplaced || code === DisconnectReason.forbidden) { WA.want = false; WA.state = "stopped"; log("Bot berhenti (kode " + code + "): sesi dipakai di tempat lain atau diblokir WhatsApp."); }
+        else if (WA.want) { const d = code === DisconnectReason.restartRequired ? 500 : Math.min(3e3 * ++WA.retry, 3e4); WA.state = "starting"; log("Koneksi terputus (kode " + code + "), menyambung ulang dalam " + Math.round(d / 1e3) + " detik..."); setTimeout(() => WA.want && waStart(WA.phone), d); }
         else WA.state = "stopped";
       }
     });
@@ -158,13 +174,13 @@ http.createServer(async (req, res) => {
         if (pw.length < 6) return J(res, 400, { error: "Kata sandi minimal 6 karakter." });
         if (users[un.toLowerCase()]) return J(res, 409, { error: "Username sudah dipakai." });
         if (Object.values(users).some(x => x.wa === wa)) return J(res, 409, { error: "Nomor WhatsApp sudah terdaftar." });
-        const u = users[un.toLowerCase()] = mkU(un, wa, pw); saveU(); return J(res, 200, session(u));
+        const u = users[un.toLowerCase()] = mkU(un, wa, pw); saveU(); log("Daftar: " + un); return J(res, 200, session(u));
       }
       if (p === "/api/auth/login") {
         const u = find(b.id);
-        if (!u || !chk(u, String(b.password || ""))) return J(res, 401, { error: "Username/nomor atau kata sandi salah." });
+        if (!u || !chk(u, String(b.password || ""))) { log("Login gagal: " + String(b.id || "").slice(0, 30) + " (" + ip + ")"); return J(res, 401, { error: "Username/nomor atau kata sandi salah." }); }
         if (u.suspended) { const ok = await sendCode(u, "sus"); return J(res, 403, { suspended: true, error: ok ? "Akun ditangguhkan admin. Kode verifikasi dikirim ke WhatsApp." : "Akun ditangguhkan admin dan bot WhatsApp sedang offline. Hubungi admin." }); }
-        return J(res, 200, session(u));
+        log("Login: " + u.username); return J(res, 200, session(u));
       }
       if (p === "/api/auth/code") { const u = find(b.id); if (u && b.purpose === "reset") await sendCode(u, "reset"); return J(res, 200, { ok: true }); }
       if (p === "/api/auth/verify") { const u = find(b.id); if (!u || !useCode(u, "sus", b.code)) return J(res, 400, { error: "Kode salah atau kedaluwarsa." }); u.suspended = false; saveU(); return J(res, 200, session(u)); }
@@ -185,23 +201,23 @@ http.createServer(async (req, res) => {
       const t = users[decodeURIComponent(mm[1]).toLowerCase()];
       if (!t) return J(res, 404, { error: "Pengguna tidak ada." });
       if (isAdm(t)) return J(res, 400, { error: "Akun admin tidak bisa diubah." });
-      if (m === "DELETE") delete users[t.username.toLowerCase()]; else if (mm[2]) t.suspended = mm[2] === "suspend"; else return J(res, 405, { error: "Metode tidak didukung." });
+      if (m === "DELETE") { delete users[t.username.toLowerCase()]; log("Admin menghapus akun " + t.username); } else if (mm[2]) { t.suspended = mm[2] === "suspend"; log("Admin " + mm[2] + " " + t.username); } else return J(res, 405, { error: "Metode tidak didukung." });
       saveU(); return J(res, 200, { ok: true });
     }
 
     if (p.startsWith("/api/") || p === "/token/check") {
-      if (!safeEq(bearer(req), ADMIN_PW)) return J(res, limited("f" + ip, 10) ? 429 : 401, { error: "Password admin salah." });
+      if (!(isAdm(authUser(req)) || safeEq(bearer(req), ADMIN_PW))) { log("Akses admin ditolak dari " + ip); return J(res, limited("f" + ip, 10) ? 429 : 401, { error: "Akses admin ditolak." }); }
       if (p === "/api/config") return J(res, 200, { ok: true, name: "Xozen" });
       if (p === "/api/wa" && m === "GET") return J(res, 200, view());
       const w = p.match(/^\/api\/wa\/(start|restart|stop|logout)$/);
-      if (w && m === "POST") { await waAct(w[1], b.phone || ""); return J(res, 200, view()); }
+      if (w && m === "POST") { log("Admin: wa " + w[1]); await waAct(w[1], b.phone || ""); return J(res, 200, view()); }
       if (p === "/api/xctl" && m === "POST") return J(res, 200, await xctl(String(b.cmd || "--help")));
       if (p === "/token/check" && m === "POST") return J(res, 200, await tokenCheck(String(b.key || "")));
     }
     J(res, 404, { error: "Tidak ditemukan." });
   } catch (e) { console.error(e); J(res, 500, { error: "Kesalahan server." }); }
 }).listen(PORT, () => {
-  console.log("Xozen server di http://localhost:" + PORT);
+  log("Xozen server di http://localhost:" + PORT);
   if (fs.existsSync(path.join(AUTH_DIR, "creds.json"))) waStart("");
 });
 process.on("unhandledRejection", e => log("Error: " + (e && e.message || e)));

@@ -555,8 +555,8 @@ applyTheme();renderAll();
 
 /* ================= ADMIN: sisa token, bot WhatsApp (Baileys), xctl ================= */
 const ADM={sub:"tok",xh:[],xi:-1,xo:""};
-const admBase=()=>(localStorage.getItem("xz_admbase")||(/^https?:$/.test(location.protocol)?location.origin:"")).replace(/\/$/,"");
-const admPw=()=>{try{return sessionStorage.getItem("xz_admt")||""}catch(e){return""}};
+const admBase=()=>((SES&&SES.adm?"":(localStorage.getItem("xz_admbase")||""))||CONFIG.AUTH_BASE||(/^https?:$/.test(location.protocol)?location.origin:"")).replace(/\/$/,"");
+const admPw=()=>{if(SES&&SES.adm&&SES.t)return SES.t;try{return sessionStorage.getItem("xz_admt")||""}catch(e){return""}};
 async function admApi(p,body){
   try{
     const r=await fetch(admBase()+p,{method:body===undefined?"GET":"POST",headers:{"Content-Type":"application/json",Authorization:"Bearer "+admPw()},body:body===undefined?undefined:JSON.stringify(body)});
@@ -569,7 +569,7 @@ function admRender(){
     b.innerHTML=`<div class="lbl">URL server admin</div><input type="text" id="admUrl" placeholder="${esc(location.origin)}" value="${esc(localStorage.getItem("xz_admbase")||"")}" autocapitalize="off" spellcheck="false"><div class="lbl">Password admin</div><input type="password" id="admPw" autocomplete="current-password"><p class="mute" id="admErr" style="color:var(--danger);min-height:1.4em;margin-top:8px"></p><button class="pill" data-adm="login">Masuk</button>`;
     return;
   }
-  b.innerHTML=`<div class="admseg">`+[["tok","Token"],["wa","WhatsApp"],["xc","xctl"]].map(t=>`<button data-adm="sub" data-s="${t[0]}" class="${ADM.sub===t[0]?"on":""}">${t[1]}</button>`).join("")+`</div><div id="admBody"></div><div class="row2"><span class="mute" style="min-width:0;overflow:hidden;text-overflow:ellipsis">${esc(admBase()||"(URL belum diisi)")}</span><button class="pill red" data-adm="exit">Keluar admin</button></div>`;
+  b.innerHTML=`<div class="admseg">`+[["tok","Token"],["wa","WhatsApp"],["xc","xctl"]].map(t=>`<button data-adm="sub" data-s="${t[0]}" class="${ADM.sub===t[0]?"on":""}">${t[1]}</button>`).join("")+`</div><div id="admBody"></div><div class="row2"><span class="mute" style="min-width:0;overflow:hidden;text-overflow:ellipsis">${esc(admBase()||"(URL belum diisi)")}</span>${SES&&SES.adm?"":'<button class="pill red" data-adm="exit">Keluar admin</button>'}</div>`;
   admSub();
 }
 function admSub(){
@@ -621,7 +621,7 @@ function admWAr(s){
 }
 async function admWA(){
   const d=await admApi("/api/wa");
-  if(d._s===401){try{sessionStorage.removeItem("xz_admt")}catch(e){}return admRender()}
+  if(d._s===401){if(SES&&SES.adm)return out("Sesi berakhir, silakan masuk lagi.");try{sessionStorage.removeItem("xz_admt")}catch(e){}return admRender()}
   if(d.error){const m=$("#admMsg");if(m)m.textContent=d.error;return}
   admWAr(d);
 }
